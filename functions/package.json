@@ -1,0 +1,13 @@
+{
+  "name": "finance-firebase-functions",
+  "description": "Webhook that bridges Meta WhatsApp Cloud API approve-button taps to Firestore and the finance-api Laravel backend.",
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "firebase-admin": "^12.6.0",
+    "firebase-functions": "^6.0.1"
+  },
+  "private": true
+}
