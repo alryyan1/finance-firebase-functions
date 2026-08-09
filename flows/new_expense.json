@@ -1,0 +1,98 @@
+{
+  "version": "7.1",
+  "screens": [
+    {
+      "id": "NEW_EXPENSE",
+      "title": "طلب صرف نثرية",
+      "terminal": true,
+      "data": {
+        "accounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "title": { "type": "string" }
+            }
+          },
+          "__example__": [
+            { "id": "1", "title": "501 — قرطاسية" },
+            { "id": "2", "title": "502 — مواصلات" }
+          ]
+        },
+        "credit_accounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "title": { "type": "string" }
+            }
+          },
+          "__example__": [
+            { "id": "1", "title": "البنك" },
+            { "id": "2", "title": "النقدية" }
+          ]
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "expense_form",
+            "children": [
+              {
+                "type": "TextInput",
+                "name": "amount",
+                "label": "المبلغ",
+                "input-type": "number",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "name": "beneficiary_name",
+                "label": "اسم المستفيد",
+                "required": false
+              },
+              {
+                "type": "Dropdown",
+                "name": "contra_account_id",
+                "label": "حساب المصروف",
+                "data-source": "${data.accounts}",
+                "required": true
+              },
+              {
+                "type": "Dropdown",
+                "name": "credit_account_id",
+                "label": "الحساب الدائن",
+                "data-source": "${data.credit_accounts}",
+                "required": true
+              },
+              {
+                "type": "TextArea",
+                "name": "description",
+                "label": "البيان",
+                "required": false
+              }
+            ]
+          },
+          {
+            "type": "Footer",
+            "label": "إرسال الطلب",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "amount": "${form.amount}",
+                "beneficiary_name": "${form.beneficiary_name}",
+                "contra_account_id": "${form.contra_account_id}",
+                "credit_account_id": "${form.credit_account_id}",
+                "description": "${form.description}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -35,6 +35,16 @@ const NEW_EXPENSE_FLOW_ID = '1371786671757124'
 // after trimming and normalizing all alef forms (أ/إ/آ) to a bare ا.
 const NEW_EXPENSE_TRIGGERS = ['اذن جديد']
 
+// Maps the WhatsApp Business phone_number_id that RECEIVED the message (from the
+// webhook payload's value.metadata.phone_number_id — Meta's ID for the business
+// number, not the sender's) to the finance/{collectionName} it belongs to. This
+// is the single source of truth for collectionName throughout this file —
+// finance/{collectionName}/whatsapp_petty_cash_senders/{phone} is looked up
+// only after this resolves, purely to authorize who may act (the manager).
+const PHONE_NUMBER_ID_COLLECTIONS = {
+  '953041111231804': 'diagnostic',
+}
+
 /**
  * Webhook for Meta's WhatsApp Cloud API. Handles the GET verification handshake,
  * and on POST, reacts to three kinds of inbound messages. Laravel is never
@@ -46,14 +56,14 @@ const NEW_EXPENSE_TRIGGERS = ['اذن جديد']
  *    - petty_cash_documents: reads document_url/document_type straight off that
  *      same Firestore doc (live, not from the button) and sends it directly to
  *      WhatsApp by link — Meta fetches public URLs itself.
- *  - A bare image/PDF from a configured manager/auditor number: cached as a
+ *  - A bare image/PDF from a configured manager number: cached as a
  *    "pending attachment" for that phone, then answered with a list message of
  *    that company's pending expenses to pick from (see ACTION_ATTACH below).
  *  - The list reply to that picker ("petty_cash_attach:{collectionName}:{id}"):
  *    downloads the previously-cached media from Meta, uploads it straight to
  *    Firebase Storage, and writes document_url/document_type onto that
  *    transaction's mirror doc — then confirms back over WhatsApp.
- *  - The text "إذن جديد" from a configured manager/auditor number: sends the
+ *  - The text "إذن جديد" from a configured manager number: sends the
  *    published "petty_cash_new_expense_request" WhatsApp Flow, its account
  *    dropdown populated from Firestore (kept in sync by Laravel whenever
  *    accounts change — see FirestoreApprovalService::syncExpenseAccounts()).
@@ -97,18 +107,27 @@ async function handleIncoming(req) {
     const value = req.body?.entry?.[0]?.changes?.[0]?.value
     const message = value?.messages?.[0]
     if (!message) {
+      logger.info('handleIncoming: no message in payload, ignoring', { body: req.body })
       return
     }
 
     const fromPhone = message.from
+    const phoneNumberId = value?.metadata?.phone_number_id
+
+    logger.info('handleIncoming: received message', {
+      fromPhone,
+      phoneNumberId,
+      type: message.type,
+      textBody: message.text?.body ?? null,
+    })
 
     if (message.type === 'image' || message.type === 'document') {
-      await handleIncomingReceipt(message, fromPhone)
+      await handleIncomingReceipt(message, fromPhone, phoneNumberId)
       return
     }
 
     if (message.type === 'text' && isNewExpenseTrigger(message.text?.body)) {
-      await handleNewExpenseTrigger(fromPhone)
+      await handleNewExpenseTrigger(fromPhone, phoneNumberId)
       return
     }
 
@@ -200,14 +219,21 @@ async function sendDocumentLink(docRef, toPhone) {
 }
 
 /**
- * A photo or PDF sent by a recognized manager/auditor number, not tied to any
+ * A photo or PDF sent by a recognized manager number, not tied to any
  * particular transaction yet. Cache it against their phone number and ask them
  * which pending expense it belongs to via a WhatsApp list message.
  */
-async function handleIncomingReceipt(message, fromPhone) {
-  const sender = await lookupSender(fromPhone)
+async function handleIncomingReceipt(message, fromPhone, phoneNumberId) {
+  const collectionName = PHONE_NUMBER_ID_COLLECTIONS[phoneNumberId]
+  if (!collectionName) {
+    logger.warn('handleIncomingReceipt: no collection mapped for phoneNumberId, ignoring', { fromPhone, phoneNumberId })
+    return
+  }
+
+  const sender = await lookupSender(fromPhone, collectionName)
   if (!sender) {
     // Unrecognized number — this webhook may also see unrelated traffic, so stay silent.
+    logger.info('handleIncomingReceipt: no sender config for phone, ignoring', { fromPhone, collectionName })
     return
   }
 
@@ -216,14 +242,26 @@ async function handleIncomingReceipt(message, fromPhone) {
     return
   }
 
-  await db.collection('whatsapp_pending_attachments').doc(fromPhone).set({
+  logger.info('handleIncomingReceipt: resolved collectionName', {
+    fromPhone,
+    phoneNumberId,
+    role: sender.role,
+    collectionName,
+  })
+
+  await db.collection('finance').doc(collectionName).collection('whatsapp_pending_attachments').doc(fromPhone).set({
     mediaId: media.id,
     mediaType: message.type,
-    collectionName: sender.collectionName,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   })
 
-  const rows = await listPendingExpenseRows(sender.collectionName)
+  await sendText(fromPhone, `تم استلام الملف — جاري البحث ضمن قائمة "${collectionName}".`)
+
+  const rows = await listPendingExpenseRows(collectionName)
+  logger.info('handleIncomingReceipt: pending expense rows fetched', {
+    collectionName,
+    rowCount: rows.length,
+  })
   if (rows.length === 0) {
     await sendText(fromPhone, 'لا توجد مصروفات بانتظار الاعتماد لإرفاق المستند بها حالياً.')
     return
@@ -233,19 +271,28 @@ async function handleIncomingReceipt(message, fromPhone) {
 }
 
 /**
- * Looks up whether a phone number is the configured petty-cash manager/auditor,
- * and which finance/{collectionName} it belongs to — mirrored into Firestore by
- * Laravel's FirestoreApprovalService::syncWhatsAppSenderConfig() whenever
- * Settings > Petty Cash is saved. Returns null for anyone else.
+ * Looks up whether a phone number is the configured petty-cash manager
+ * for the given company — mirrored into Firestore by Laravel's
+ * FirestoreApprovalService::syncWhatsAppSenderConfig() whenever Settings >
+ * Petty Cash is saved. collectionName is resolved by the caller from
+ * PHONE_NUMBER_ID_COLLECTIONS before this runs, so this is purely an
+ * authorization check (who may act) — not a source of collectionName.
+ * Returns null for anyone not configured under that company.
  */
-async function lookupSender(phone) {
-  const snapshot = await db.collection('whatsapp_petty_cash_senders').doc(phone).get()
+async function lookupSender(phone, collectionName) {
+  const snapshot = await db.collection('finance').doc(collectionName).collection('whatsapp_petty_cash_senders').doc(phone).get()
   const data = snapshot.data()
-  if (!data?.collection_name) {
+  logger.info('lookupSender: read whatsapp_petty_cash_senders doc', {
+    phone,
+    collectionName,
+    exists: snapshot.exists,
+    data: data ?? null,
+  })
+  if (!data?.role) {
     return null
   }
 
-  return { role: data.role, collectionName: data.collection_name }
+  return { role: data.role }
 }
 
 /** Trims and normalizes alef/hamza variants (أ/إ/آ → ا) before comparing against NEW_EXPENSE_TRIGGERS. */
@@ -259,29 +306,58 @@ function isNewExpenseTrigger(text) {
 }
 
 /**
- * "إذن جديد" from a recognized manager/auditor number — send the published
+ * "إذن جديد" from a recognized manager number — send the published
  * "new expense" Flow, with its account dropdown populated from whichever
  * accounts Laravel last synced to Firestore for that company.
  */
-async function handleNewExpenseTrigger(fromPhone) {
-  const sender = await lookupSender(fromPhone)
-  if (!sender) {
+async function handleNewExpenseTrigger(fromPhone, phoneNumberId) {
+  const collectionName = PHONE_NUMBER_ID_COLLECTIONS[phoneNumberId]
+  if (!collectionName) {
+    logger.warn('handleNewExpenseTrigger: no collection mapped for phoneNumberId, ignoring', { fromPhone, phoneNumberId })
     return
   }
 
-  const accounts = await fetchExpenseAccounts(sender.collectionName)
+  const sender = await lookupSender(fromPhone, collectionName)
+  if (!sender) {
+    logger.warn('handleNewExpenseTrigger: no sender config found, ignoring', { fromPhone, collectionName })
+    return
+  }
+
+  const accounts = await fetchExpenseAccounts(collectionName)
+  logger.info('handleNewExpenseTrigger: fetched expense accounts', {
+    fromPhone,
+    collectionName,
+    accountCount: accounts.length,
+  })
   if (accounts.length === 0) {
     await sendText(fromPhone, 'لا توجد حسابات مصروفات مُعدّة في النظام بعد.')
     return
   }
 
-  await sendNewExpenseFlow(fromPhone, sender.collectionName, accounts)
+  const creditAccounts = await fetchCreditAccounts(collectionName)
+  logger.info('handleNewExpenseTrigger: fetched credit accounts', {
+    fromPhone,
+    collectionName,
+    accountCount: creditAccounts.length,
+  })
+  if (creditAccounts.length === 0) {
+    await sendText(fromPhone, 'لم يتم إعداد حسابات صندوق النثريات (بنك/نقدية) بعد.')
+    return
+  }
+
+  await sendNewExpenseFlow(fromPhone, collectionName, accounts, creditAccounts)
 }
 
 /** Reads the {id, title}[] account list Laravel mirrors into Firestore whenever accounts change. */
 async function fetchExpenseAccounts(collectionName) {
+  const docPath = `finance/${collectionName}/whatsapp_expense_accounts/config`
   const snapshot = await db.collection('finance').doc(collectionName).collection('whatsapp_expense_accounts').doc('config').get()
   const raw = snapshot.data()?.accounts_json
+  logger.info('fetchExpenseAccounts: read whatsapp_expense_accounts doc', {
+    docPath,
+    exists: snapshot.exists,
+    rawLength: raw ? raw.length : 0,
+  })
   if (!raw) {
     return []
   }
@@ -294,7 +370,29 @@ async function fetchExpenseAccounts(collectionName) {
   }
 }
 
-async function sendNewExpenseFlow(toPhone, collectionName, accounts) {
+/** Reads the {id, title}[] pair (bank + cash) Laravel mirrors into Firestore whenever those settings are saved. */
+async function fetchCreditAccounts(collectionName) {
+  const docPath = `finance/${collectionName}/whatsapp_credit_accounts/config`
+  const snapshot = await db.collection('finance').doc(collectionName).collection('whatsapp_credit_accounts').doc('config').get()
+  const raw = snapshot.data()?.accounts_json
+  logger.info('fetchCreditAccounts: read whatsapp_credit_accounts doc', {
+    docPath,
+    exists: snapshot.exists,
+    rawLength: raw ? raw.length : 0,
+  })
+  if (!raw) {
+    return []
+  }
+
+  try {
+    return JSON.parse(raw)
+  } catch (err) {
+    logger.error('Failed to parse whatsapp_credit_accounts accounts_json', { collectionName, error: String(err) })
+    return []
+  }
+}
+
+async function sendNewExpenseFlow(toPhone, collectionName, accounts, creditAccounts) {
   const flowToken = `${collectionName}:${crypto.randomUUID()}`
 
   const response = await fetch(
@@ -323,7 +421,7 @@ async function sendNewExpenseFlow(toPhone, collectionName, accounts) {
               flow_action: 'navigate',
               flow_action_payload: {
                 screen: 'NEW_EXPENSE',
-                data: { accounts },
+                data: { accounts, credit_accounts: creditAccounts },
               },
             },
           },
@@ -366,6 +464,7 @@ async function handleNewExpenseFlowSubmission(nfmReply, fromPhone) {
     amount: fields.amount ?? null,
     beneficiary_name: fields.beneficiary_name ?? null,
     contra_account_id: fields.contra_account_id ?? null,
+    credit_account_id: fields.credit_account_id ?? null,
     description: fields.description ?? null,
     submitted_by_phone: fromPhone,
     submitted_at: admin.firestore.FieldValue.serverTimestamp(),
@@ -451,7 +550,7 @@ async function handleTransactionPicked(listReplyId, fromPhone) {
     return
   }
 
-  const pendingRef = db.collection('whatsapp_pending_attachments').doc(fromPhone)
+  const pendingRef = db.collection('finance').doc(collectionName).collection('whatsapp_pending_attachments').doc(fromPhone)
   const pendingSnap = await pendingRef.get()
   const pending = pendingSnap.data()
 
